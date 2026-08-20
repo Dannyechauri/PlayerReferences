@@ -1,8 +1,12 @@
+import os
 import sqlite3
+import sys
 from datetime import datetime, timezone
 from contextlib import contextmanager
 
-DB_PATH = "players.db"
+# Keep the DB next to the executable (frozen) or the source file (dev)
+_BASE_DIR = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else __file__)
+DB_PATH = os.path.join(_BASE_DIR, "players.db")
 
 
 def init_db():
@@ -134,6 +138,19 @@ def init_db():
                 created_at  TEXT NOT NULL
             )
         """)
+        _prune_noteless_opponents(conn)
+
+
+def _prune_noteless_opponents(conn: sqlite3.Connection):
+    """Keep only players that have at least one note."""
+    conn.execute(
+        """DELETE FROM opponent_name_history
+           WHERE profile_id NOT IN (SELECT profile_id FROM opponent_notes)"""
+    )
+    conn.execute(
+        """DELETE FROM opponents
+           WHERE profile_id NOT IN (SELECT profile_id FROM opponent_notes)"""
+    )
 
 
 @contextmanager
@@ -215,6 +232,22 @@ def save_matches(my_pid: int, matches: list[dict]) -> tuple[int, int]:
                 ).fetchone()
                 match_id = row["id"] if row else None
                 is_new_match = False
+                if match_id:
+                    # Refresh state so finished matches stop showing as live
+                    conn.execute(
+                        """UPDATE matches
+                           SET is_live = ?, my_won = ?, map_name = COALESCE(?, map_name),
+                               started_at = COALESCE(?, started_at), scraped_at = ?
+                           WHERE id = ?""",
+                        (
+                            1 if m.get("is_live") else 0,
+                            1 if m.get("my_won") is True else (0 if m.get("my_won") is False else None),
+                            m.get("map_name"),
+                            m.get("started_at"),
+                            now,
+                            match_id,
+                        ),
+                    )
 
             for opp in m.get("opponents", []):
                 pid = opp.get("pid")
@@ -237,30 +270,23 @@ def save_matches(my_pid: int, matches: list[dict]) -> tuple[int, int]:
                 if not pid:
                     continue
 
+                # Only players with at least one note are kept in `opponents`
                 existing = conn.execute(
                     "SELECT name FROM opponents WHERE profile_id = ?", (pid,)
                 ).fetchone()
 
                 if existing is None:
-                    conn.execute(
-                        "INSERT INTO opponents (profile_id, name, first_seen, last_seen) VALUES (?,?,?,?)",
-                        (pid, name, now, now),
-                    )
+                    continue
+
+                conn.execute(
+                    "UPDATE opponents SET last_seen = ?, name = ? WHERE profile_id = ?",
+                    (now, name, pid),
+                )
+                if existing["name"] != name:
                     conn.execute(
                         "INSERT INTO opponent_name_history (profile_id, name, recorded_at) VALUES (?,?,?)",
                         (pid, name, now),
                     )
-                    new_opponents += 1
-                else:
-                    conn.execute(
-                        "UPDATE opponents SET last_seen = ?, name = ? WHERE profile_id = ?",
-                        (now, name, pid),
-                    )
-                    if existing["name"] != name:
-                        conn.execute(
-                            "INSERT INTO opponent_name_history (profile_id, name, recorded_at) VALUES (?,?,?)",
-                            (pid, name, now),
-                        )
 
     return new_matches, new_opponents
 
@@ -377,3 +403,4 @@ def get_notes(profile_id: int) -> list[dict]:
 def delete_note(note_id: int):
     with _connection() as conn:
         conn.execute("DELETE FROM opponent_notes WHERE id = ?", (note_id,))
+        _prune_noteless_opponents(conn)

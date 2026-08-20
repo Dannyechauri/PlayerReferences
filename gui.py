@@ -67,12 +67,70 @@ def _speak(text: str):
     threading.Thread(target=run_async, daemon=True).start()
 
 
+# ── Loading dialog ────────────────────────────────────────────────────────────
+
+class LoadingDialog(ctk.CTkToplevel):
+    """Small modal shown while match data is being loaded into the UI."""
+
+    def __init__(self, master, initial_name: str = "…"):
+        super().__init__(master)
+        self.title("Cargando partidas")
+        self.geometry("400x150")
+        self.resizable(False, False)
+        self.transient(master)
+        self.protocol("WM_DELETE_WINDOW", lambda: None)
+        self.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            self, text="Cargando los datos de:", font=_FONT_H2, text_color="#aaa"
+        ).grid(row=0, column=0, padx=20, pady=(24, 4))
+
+        self._name_lbl = ctk.CTkLabel(
+            self, text=initial_name, font=_FONT_H1, text_color=_COL_ACCENT, wraplength=350
+        )
+        self._name_lbl.grid(row=1, column=0, padx=20)
+
+        self._bar = ctk.CTkProgressBar(self, width=320)
+        self._bar.grid(row=2, column=0, padx=20, pady=(14, 20))
+        self._bar.set(0)
+
+        self.update_idletasks()
+        x = master.winfo_rootx() + (master.winfo_width() - self.winfo_width()) // 2
+        y = master.winfo_rooty() + (master.winfo_height() - self.winfo_height()) // 3
+        self.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+        # Force the dialog to the front (CTkToplevel can otherwise stay behind)
+        self.deiconify()
+        self.lift()
+        self.attributes("-topmost", True)
+        self.focus_force()
+        self.grab_set()
+        self.update()
+
+    def set_player(self, name: str, progress: float | None = None):
+        if not self.winfo_exists():
+            return
+        self._name_lbl.configure(text=name)
+        if progress is not None:
+            self._bar.set(min(max(progress, 0.0), 1.0))
+        self.lift()
+        self.update_idletasks()
+
+    def close(self):
+        try:
+            self.grab_release()
+            self.destroy()
+        except Exception:
+            pass
+
+
 # ── Notes Dialog (opens on double-click in match view) ────────────────────────
 
 class NotesDialog(ctk.CTkToplevel):
     """Modal window showing notes for one opponent, opened by double-click."""
 
-    def __init__(self, master, profile_id: int, player_name: str):
+    def __init__(self, master, profile_id: int, player_name: str,
+                 on_change: Callable[[], None] | None = None):
         super().__init__(master)
         self.title(f"Notas – {player_name}")
         self.geometry("580x500")
@@ -83,6 +141,7 @@ class NotesDialog(ctk.CTkToplevel):
 
         self._profile_id = profile_id
         self._player_name = player_name
+        self._on_change = on_change
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
@@ -142,10 +201,16 @@ class NotesDialog(ctk.CTkToplevel):
         db.add_note(self._profile_id, text)
         self._note_input.delete("1.0", "end")
         self._load_notes()
+        self._notify_change()
 
     def _delete_note(self, note_id: int):
         db.delete_note(note_id)
         self._load_notes()
+        self._notify_change()
+
+    def _notify_change(self):
+        if self._on_change is not None:
+            self._on_change()
 
 
 # ── Match card widget ─────────────────────────────────────────────────────────
@@ -318,6 +383,7 @@ class App(ctk.CTk):
         self._opp_rows: list[OpponentRow] = []
         self._scraping = False
         self._live_match_key: str | None = None
+        self._loading_dlg: LoadingDialog | None = None
 
         self._build_ui()
 
@@ -325,10 +391,73 @@ class App(ctk.CTk):
         if saved:
             self._my_pid = saved
             self._pid_entry.insert(0, str(saved))
-            self._refresh_opponent_list()
-            self._refresh_matches_tab()
+            self.after(100, self._initial_load)
 
         self.after(5000, self._poll_live)
+
+    # ── Startup loading ───────────────────────────────────────────────────────
+
+    def _initial_load(self):
+        """Populate match/opponent panels incrementally, with a progress dialog."""
+        self._loading_dlg = LoadingDialog(self)
+        self._populate_matches(self._loading_dlg)
+
+    def _populate_matches(self, dlg: "LoadingDialog | None"):
+        """Build match cards one per event-loop tick so the UI stays responsive."""
+        def show(name: str, progress: float | None = None):
+            if dlg is not None:
+                dlg.set_player(name, progress)
+
+        try:
+            matches = db.get_match_history(self._my_pid, limit=30)
+        except Exception as exc:
+            self._close_loading_dialog()
+            self._set_status(f"✗ Error cargando partidas: {exc}", error=True)
+            return
+
+        for w in self._matches_scroll.winfo_children():
+            w.destroy()
+
+        if not matches:
+            ctk.CTkLabel(
+                self._matches_scroll,
+                text="Sin partidas guardadas. Usa 'Cargar mis partidas'.",
+                font=_FONT_SMALL, text_color="#555",
+            ).pack(anchor="w", padx=10, pady=10)
+            self._refresh_opponent_list()
+            self._close_loading_dialog()
+            return
+
+        total = len(matches)
+
+        def step(i: int = 0):
+            try:
+                if i >= total:
+                    show("Oponentes…", 1.0)
+                    self._refresh_opponent_list()
+                    self._close_loading_dialog()
+                    return
+                m = matches[i]
+                name = next(
+                    (
+                        p.get("name", "?")
+                        for players in m.get("teams", {}).values()
+                        for p in players
+                        if p.get("profile_id") != self._my_pid
+                    ),
+                    "…",
+                )
+                show(name, (i + 1) / total)
+                MatchCard(
+                    self._matches_scroll, match=m, my_pid=self._my_pid,
+                    open_notes=self._open_notes_dialog,
+                ).pack(fill="x", padx=4, pady=3)
+                self.after(1, lambda: step(i + 1))
+            except Exception as exc:
+                self._close_loading_dialog()
+                self._set_status(f"✗ Error cargando partidas: {exc}", error=True)
+
+        step()
 
     # ── Layout ────────────────────────────────────────────────────────────────
 
@@ -713,9 +842,10 @@ class App(ctk.CTk):
         self._set_status("Nota eliminada.")
 
     def _open_notes_dialog(self, profile_id: int, player_name: str):
-        NotesDialog(self, profile_id, player_name)
-        # Refresh opponents list in case a new note was added for a new opponent
-        self.after(200, self._refresh_opponent_list)
+        NotesDialog(
+            self, profile_id, player_name,
+            on_change=lambda: self._refresh_opponent_list(self._search_var.get()),
+        )
 
     # ── Matches tab ───────────────────────────────────────────────────────────
 
@@ -758,6 +888,7 @@ class App(ctk.CTk):
         db.set_my_profile_id(pid)
         self._scraping = True
         self._set_status(f"Scrapeando partidas de [{pid}]…")
+        self._loading_dlg = LoadingDialog(self, initial_name=f"[{pid}]")
         threading.Thread(target=self._scrape_worker, args=(pid,), daemon=True).start()
 
     def _scrape_worker(self, my_pid: int):
@@ -771,6 +902,9 @@ class App(ctk.CTk):
             )
             if my_name:
                 self.after(0, lambda n=my_name: self._my_name_lbl.configure(text=n))
+                self.after(0, lambda n=my_name: (
+                    self._loading_dlg.set_player(n, 0.3) if self._loading_dlg else None
+                ))
 
             match_dicts = [
                 {
@@ -788,16 +922,22 @@ class App(ctk.CTk):
             unique_opps = len({
                 p.profile_id for m in matches for p in m.all_players if not p.is_me
             })
-            self.after(0, self._refresh_opponent_list)
-            self.after(0, self._refresh_matches_tab)
+            self.after(0, lambda: self._populate_matches(self._loading_dlg))
             self.after(0, lambda: self._set_status(
                 f"✓ {len(matches)} partidas  ·  {unique_opps} oponentes únicos  "
                 f"·  {new_m} nuevas guardadas  ·  {new_o} oponentes nuevos"
             ))
         except Exception as exc:
+            self.after(0, self._close_loading_dialog)
             self.after(0, lambda: self._set_status(f"✗ Error: {exc}", error=True))
         finally:
             self._scraping = False
+
+    def _close_loading_dialog(self):
+        dlg = getattr(self, "_loading_dlg", None)
+        if dlg is not None:
+            dlg.close()
+            self._loading_dlg = None
 
     # ── Status bar ────────────────────────────────────────────────────────────
 
