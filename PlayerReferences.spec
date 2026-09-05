@@ -4,8 +4,10 @@ from PyInstaller.utils.hooks import collect_all
 datas = []
 binaries = []
 hiddenimports = []
-tmp_ret = collect_all('customtkinter')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+# customtkinter y webdriver_manager necesitan sus datos/metadata; el resto lo resuelven los hooks de PyInstaller.
+for _pkg in ('customtkinter', 'webdriver_manager'):
+    _d, _b, _h = collect_all(_pkg)
+    datas += _d; binaries += _b; hiddenimports += _h
 
 
 a = Analysis(
@@ -17,7 +19,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['numpy', 'setuptools', 'pip', 'tkinter.test', 'test'],
     noarchive=False,
     optimize=0,
 )

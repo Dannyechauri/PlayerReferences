@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import subprocess
 import threading
+from tkinter import messagebox
 from typing import Callable
 
 import customtkinter as ctk
@@ -58,11 +59,17 @@ def _speak(text: str):
         "$s.Rate = 1; "
         f'$s.Speak("{safe}")'
     )
+
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+
     def run_async():
         subprocess.Popen(
             ["powershell", "-NoProfile", "-Command", ps],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            startupinfo=startupinfo,
         )
     threading.Thread(target=run_async, daemon=True).start()
 
@@ -213,6 +220,96 @@ class NotesDialog(ctk.CTkToplevel):
             self._on_change()
 
 
+# ── Add user by Id Dialog ──────────────────────────────────────────────────────
+
+class AddUserByIdDialog(ctk.CTkToplevel):
+    """Modal to register an opponent directly by profile Id and add a note."""
+
+    def __init__(self, master, on_change: Callable[[], None] | None = None):
+        super().__init__(master)
+        self.title("Agregar usuario por Id")
+        self.geometry("480x420")
+        self.resizable(True, True)
+        self.transient(master)
+        self.grab_set()
+        self.focus()
+
+        self._on_change = on_change
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(3, weight=1)
+
+        # Id input row
+        id_row = ctk.CTkFrame(self, fg_color="transparent")
+        id_row.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 6))
+        ctk.CTkLabel(id_row, text="Id del jugador:", font=_FONT_NORMAL).pack(side="left", padx=(0, 8))
+        vcmd = (self.register(self._validate_digits), "%P")
+        self._pid_entry = ctk.CTkEntry(
+            id_row, width=150, font=_FONT_MONO, validate="key", validatecommand=vcmd,
+        )
+        self._pid_entry.pack(side="left", padx=(0, 8))
+
+        # Name input row
+        name_row = ctk.CTkFrame(self, fg_color="transparent")
+        name_row.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 10))
+        ctk.CTkLabel(name_row, text="Nombre (obligatorio):", font=_FONT_NORMAL).pack(side="left", padx=(0, 8))
+        self._name_entry = ctk.CTkEntry(name_row, font=_FONT_NORMAL)
+        self._name_entry.pack(side="left", fill="x", expand=True)
+
+        ctk.CTkFrame(self, height=1, fg_color=_COL_SEP).grid(row=2, column=0, sticky="ew", padx=8)
+
+        # New note
+        note_area = ctk.CTkFrame(self, fg_color="transparent")
+        note_area.grid(row=3, column=0, sticky="nsew", padx=16, pady=(10, 6))
+        note_area.grid_columnconfigure(0, weight=1)
+        note_area.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(note_area, text="Nota (obligatoria):", font=_FONT_SMALL, text_color="#888").grid(
+            row=0, column=0, sticky="w", pady=(0, 4)
+        )
+        self._note_input = ctk.CTkTextbox(note_area, font=_FONT_NORMAL)
+        self._note_input.grid(row=1, column=0, sticky="nsew")
+
+        # Status + save
+        self._status_lbl = ctk.CTkLabel(self, text="", font=_FONT_SMALL, text_color="#d45050")
+        self._status_lbl.grid(row=4, column=0, sticky="w", padx=16)
+        ctk.CTkButton(
+            self, text="Guardar", command=self._save, width=140, height=34
+        ).grid(row=5, column=0, sticky="w", padx=16, pady=(6, 16))
+
+    @staticmethod
+    def _validate_digits(new_value: str) -> bool:
+        return new_value == "" or new_value.isdigit()
+
+    def _parse_pid(self) -> int | None:
+        pid_text = self._pid_entry.get().strip()
+        if not pid_text:
+            self._status_lbl.configure(text="Introduce un Id.")
+            return None
+        try:
+            return int(pid_text)
+        except ValueError:
+            self._status_lbl.configure(text="El Id debe ser numérico.")
+            return None
+
+    def _save(self):
+        pid = self._parse_pid()
+        if pid is None:
+            return
+        name = self._name_entry.get().strip()
+        if not name:
+            self._status_lbl.configure(text="El nombre es obligatorio.")
+            return
+        text = self._note_input.get("1.0", "end").strip()
+        if not text:
+            self._status_lbl.configure(text="La nota es obligatoria.")
+            return
+        db.ensure_opponent(pid, name)
+        db.add_note(pid, text)
+        if self._on_change is not None:
+            self._on_change()
+        self.destroy()
+
+
 # ── Match card widget ─────────────────────────────────────────────────────────
 
 class MatchCard(ctk.CTkFrame):
@@ -323,11 +420,13 @@ class OpponentRow(ctk.CTkFrame):
     """Clickable row for one opponent in the left panel list."""
 
     def __init__(
-        self, master, opp: dict, on_select: Callable[[dict], None], **kwargs
+        self, master, opp: dict, on_select: Callable[[dict], None],
+        on_delete: Callable[[dict], None] | None = None, **kwargs
     ):
         super().__init__(master, cursor="hand2", corner_radius=4, **kwargs)
         self._opp = opp
         self._on_select = on_select
+        self._on_delete = on_delete
         self.grid_columnconfigure(1, weight=1)
         self._build(opp)
 
@@ -361,6 +460,14 @@ class OpponentRow(ctk.CTkFrame):
             badge.bind("<Button-1>", click)
             col += 1
 
+        if self._on_delete is not None:
+            del_btn = ctk.CTkButton(
+                self, text="🗑", width=26, height=24, fg_color="transparent",
+                hover_color="#622d2d", command=lambda o=opp: self._on_delete(o),
+            )
+            del_btn.grid(row=0, column=col, padx=(0, 6))
+            col += 1
+
         self.bind("<Button-1>", click)
 
     def set_selected(self, selected: bool):
@@ -384,13 +491,15 @@ class App(ctk.CTk):
         self._scraping = False
         self._live_match_key: str | None = None
         self._loading_dlg: LoadingDialog | None = None
+        self._name_check_running = False
 
         self._build_ui()
 
-        saved = db.get_my_profile_id()
-        if saved:
+        saved_ids = db.get_my_profile_ids()
+        if saved_ids:
+            saved = saved_ids[0]
             self._my_pid = saved
-            self._pid_entry.insert(0, str(saved))
+            self._pid_entry.set(str(saved))
             self.after(100, self._initial_load)
 
         self.after(5000, self._poll_live)
@@ -436,6 +545,7 @@ class App(ctk.CTk):
                     show("Oponentes…", 1.0)
                     self._refresh_opponent_list()
                     self._close_loading_dialog()
+                    self._check_opponent_names_bg()
                     return
                 m = matches[i]
                 name = next(
@@ -474,11 +584,13 @@ class App(ctk.CTk):
         bar.grid(row=0, column=0, sticky="ew")
         bar.grid_propagate(False)
 
-        ctk.CTkLabel(bar, text="Mi Profile ID:", font=_FONT_NORMAL).pack(
+        ctk.CTkLabel(bar, text="Mi Id:", font=_FONT_NORMAL).pack(
             side="left", padx=(18, 6), pady=14
         )
-        self._pid_entry = ctk.CTkEntry(
-            bar, placeholder_text="ej. 459658", width=150, font=_FONT_MONO
+        self._pid_entry = ctk.CTkComboBox(
+            bar, values=[str(pid) for pid in db.get_my_profile_ids()],
+            width=150, font=_FONT_MONO, dropdown_font=_FONT_MONO,
+            state="normal",
         )
         self._pid_entry.pack(side="left", padx=(0, 6), pady=12)
         self._pid_entry.bind("<Return>", lambda _: self._start_scrape())
@@ -499,6 +611,11 @@ class App(ctk.CTk):
             bar, text="↻ Actualizar", command=self._start_scrape,
             width=110, height=32, fg_color="#285228", hover_color="#357035",
         ).pack(side="left", pady=11)
+
+        ctk.CTkButton(
+            bar, text="Agregar usuario por id", command=self._open_add_user_dialog,
+            width=190, height=32, fg_color="#4a3a7a", hover_color="#5c4a94",
+        ).pack(side="right", padx=(0, 18), pady=11)
 
     def _build_content(self):
         pane = ctk.CTkFrame(self, fg_color="transparent")
@@ -774,7 +891,7 @@ class App(ctk.CTk):
         for opp in opponents:
             row = OpponentRow(
                 self._opp_scroll, opp=opp, on_select=self._select_opponent,
-                fg_color="transparent",
+                on_delete=self._delete_opponent, fg_color="transparent",
             )
             row.grid(sticky="ew", pady=1)
             if (
@@ -786,6 +903,54 @@ class App(ctk.CTk):
 
     def _filter_list(self):
         self._refresh_opponent_list(self._search_var.get())
+
+    def _check_opponent_names_bg(self):
+        """Look up each opponent's current name via the API and update if changed."""
+        if self._name_check_running or self._my_pid is None:
+            return
+        opponents = db.get_opponents(self._my_pid)
+        if not opponents:
+            return
+        self._name_check_running = True
+        threading.Thread(
+            target=self._check_opponent_names_worker,
+            args=(self._my_pid, [(o["profile_id"], o["name"]) for o in opponents]),
+            daemon=True,
+        ).start()
+
+    def _check_opponent_names_worker(self, my_pid: int, opponents: list[tuple[int, str]]):
+        changed = 0
+        try:
+            for pid, old_name in opponents:
+                new_name = scraper.get_player_name_api(pid)
+                if new_name and new_name != old_name and db.update_opponent_name(pid, new_name):
+                    changed += 1
+        finally:
+            self._name_check_running = False
+        if changed and my_pid == self._my_pid:
+            self.after(0, lambda: self._refresh_opponent_list(self._search_var.get()))
+            self.after(0, lambda: self._set_status(
+                f"✓ {changed} nombre(s) de oponente actualizado(s)."
+            ))
+
+    def _delete_opponent(self, opp: dict):
+        confirm = messagebox.askyesno(
+            "Eliminar oponente",
+            f"¿Eliminar a \"{opp['name']}\" (Id {opp['profile_id']}) y todas sus notas?",
+            parent=self,
+        )
+        if not confirm:
+            return
+        db.delete_opponent(opp["profile_id"])
+        if self._selected_opp and self._selected_opp["profile_id"] == opp["profile_id"]:
+            self._selected_opp = None
+            self._opp_name_lbl.configure(text="← Selecciona un oponente", text_color="#555")
+            self._opp_meta_lbl.configure(text="")
+            self._save_btn.configure(state="disabled")
+            for w in self._notes_scroll.winfo_children():
+                w.destroy()
+        self._refresh_opponent_list(self._search_var.get())
+        self._set_status("✓ Oponente eliminado.")
 
     def _select_opponent(self, opp: dict):
         self._selected_opp = opp
@@ -847,6 +1012,12 @@ class App(ctk.CTk):
             on_change=lambda: self._refresh_opponent_list(self._search_var.get()),
         )
 
+    def _open_add_user_dialog(self):
+        AddUserByIdDialog(
+            self,
+            on_change=lambda: self._refresh_opponent_list(self._search_var.get()),
+        )
+
     # ── Matches tab ───────────────────────────────────────────────────────────
 
     def _refresh_matches_tab(self):
@@ -873,12 +1044,12 @@ class App(ctk.CTk):
     def _start_scrape(self):
         pid_text = self._pid_entry.get().strip()
         if not pid_text:
-            self._set_status("Introduce tu Profile ID.", error=True)
+            self._set_status("Introduce tu Id.", error=True)
             return
         try:
             pid = int(pid_text)
         except ValueError:
-            self._set_status("El Profile ID debe ser numérico.", error=True)
+            self._set_status("El Id debe ser numérico.", error=True)
             return
         if self._scraping:
             self._set_status("Ya hay un scraping en curso, espera.", error=True)
@@ -886,6 +1057,7 @@ class App(ctk.CTk):
 
         self._my_pid = pid
         db.set_my_profile_id(pid)
+        self._pid_entry.configure(values=[str(saved_pid) for saved_pid in db.get_my_profile_ids()])
         self._scraping = True
         self._set_status(f"Scrapeando partidas de [{pid}]…")
         self._loading_dlg = LoadingDialog(self, initial_name=f"[{pid}]")

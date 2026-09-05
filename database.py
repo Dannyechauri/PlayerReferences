@@ -182,11 +182,46 @@ def get_my_profile_id() -> int | None:
         return int(row["value"]) if row else None
 
 
+def get_my_profile_ids() -> list[int]:
+    """Return previously used profile ids, newest first."""
+    with _connection() as conn:
+        row = conn.execute(
+            "SELECT value FROM app_config WHERE key = 'my_profile_id_history'"
+        ).fetchone()
+        if not row:
+            current = get_my_profile_id()
+            return [current] if current is not None else []
+
+        ids = []
+        for value in row["value"].split(","):
+            try:
+                pid = int(value)
+            except ValueError:
+                continue
+            if pid not in ids:
+                ids.append(pid)
+        return ids
+
+
 def set_my_profile_id(pid: int):
     with _connection() as conn:
+        current_row = conn.execute(
+            "SELECT value FROM app_config WHERE key = 'my_profile_id'"
+        ).fetchone()
+        history_row = conn.execute(
+            "SELECT value FROM app_config WHERE key = 'my_profile_id_history'"
+        ).fetchone()
         conn.execute(
             "INSERT OR REPLACE INTO app_config (key, value) VALUES ('my_profile_id', ?)",
             (str(pid),),
+        )
+        previous = [] if not history_row else history_row["value"].split(",")
+        if current_row and current_row["value"] not in previous:
+            previous.append(current_row["value"])
+        history = [str(pid)] + [value for value in previous if value and value != str(pid)]
+        conn.execute(
+            "INSERT OR REPLACE INTO app_config (key, value) VALUES ('my_profile_id_history', ?)",
+            (",".join(history),),
         )
 
 
@@ -338,6 +373,27 @@ def ensure_opponent(profile_id: int, name: str):
             )
 
 
+def update_opponent_name(profile_id: int, name: str) -> bool:
+    """Update stored opponent name if it changed. Returns True when updated."""
+    if not name:
+        return False
+    with _connection() as conn:
+        existing = conn.execute(
+            "SELECT name FROM opponents WHERE profile_id = ?", (profile_id,)
+        ).fetchone()
+        if existing is None or existing["name"] == name:
+            return False
+        now = _now()
+        conn.execute(
+            "UPDATE opponents SET name = ? WHERE profile_id = ?", (name, profile_id),
+        )
+        conn.execute(
+            "INSERT INTO opponent_name_history (profile_id, name, recorded_at) VALUES (?,?,?)",
+            (profile_id, name, now),
+        )
+        return True
+
+
 def get_opponents(my_pid: int, search: str = "") -> list[dict]:
     """Return all opponents sorted by times_met desc, with note_count."""
     params: list = [my_pid]
@@ -404,3 +460,11 @@ def delete_note(note_id: int):
     with _connection() as conn:
         conn.execute("DELETE FROM opponent_notes WHERE id = ?", (note_id,))
         _prune_noteless_opponents(conn)
+
+
+def delete_opponent(profile_id: int):
+    """Remove an opponent entirely: its notes, name history, and registry entry."""
+    with _connection() as conn:
+        conn.execute("DELETE FROM opponent_notes WHERE profile_id = ?", (profile_id,))
+        conn.execute("DELETE FROM opponent_name_history WHERE profile_id = ?", (profile_id,))
+        conn.execute("DELETE FROM opponents WHERE profile_id = ?", (profile_id,))
